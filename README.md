@@ -182,6 +182,10 @@ vzdump calls the script at every stage of a backup. At `job-end`, it starts
 always exits 0, so it can never make a backup fail. If two jobs finish close
 together, the second upload waits for the first (lock) instead of being skipped.
 
+## Roadmap
+
+Host configuration backup (`/etc/pve`, `config.db`, `/etc`, …) is planned, see [ROADMAP.md](ROADMAP.md).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
