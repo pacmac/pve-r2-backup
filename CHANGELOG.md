@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.2 - 2026-10-23
+
+- Fixed `install` failing with `HTTP Error 403` when downloading rclone: downloads.rclone.org
+  rejects Python's default User-Agent. Downloads now identify as `pve-r2-backup/<version>`,
+  and network errors give a clear message instead of a traceback.
+
 ## 2.0.1 - 2026-10-23
 
 - Messages stay in order with rclone/pct output when the output is piped or logged.

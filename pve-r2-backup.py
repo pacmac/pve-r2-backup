@@ -46,11 +46,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 SELF_INSTALLED = Path("/usr/local/sbin/pve-r2-backup")
 # credentials (r2.env) and generated rclone.conf live in root's home, mode 700/600
@@ -633,6 +634,18 @@ LOGROTATE = f"""{LOG_FILE} {{
 """
 
 
+def fetch(url, dest):
+    """Download url to dest. downloads.rclone.org rejects Python's default
+    User-Agent with 403, so identify as this tool."""
+    req = urllib.request.Request(url, headers={"User-Agent": f"pve-r2-backup/{VERSION} "
+                                               "(+https://github.com/pacmac/pve-r2-backup)"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
+            shutil.copyfileobj(resp, out)
+    except (urllib.error.URLError, OSError) as e:
+        raise Fatal(f"download of {url} failed: {e}")
+
+
 def rclone_version():
     try:
         m = re.search(r"rclone v(\d+)\.(\d+)", run(["rclone", "version"]))
@@ -651,7 +664,7 @@ def do_install():
         with tempfile.NamedTemporaryFile(suffix=".deb", delete=False) as f:
             deb = f.name
         try:
-            urllib.request.urlretrieve(f"https://downloads.rclone.org/rclone-current-linux-{arch}.deb", deb)
+            fetch(f"https://downloads.rclone.org/rclone-current-linux-{arch}.deb", deb)
             run(["dpkg", "-i", deb], capture=False)
         finally:
             os.unlink(deb)
