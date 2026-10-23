@@ -50,7 +50,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 SELF_INSTALLED = Path("/usr/local/sbin/pve-r2-backup")
 # credentials (r2.env) and generated rclone.conf live in root's home, mode 700/600
@@ -1098,6 +1098,8 @@ def restore_cmd_text(gtype, target, archive, storage):
 # ------------------------------------------------------------------------------
 
 def main(argv=None):
+    # line-buffered so our messages stay in order with rclone/pct output when piped or logged
+    sys.stdout.reconfigure(line_buffering=True)
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in HOOK_PHASES:
         return do_hook(argv[0])

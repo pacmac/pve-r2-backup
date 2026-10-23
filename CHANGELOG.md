@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.1 - 2026-10-23
+
+- Messages stay in order with rclone/pct output when the output is piped or logged.
+- Verified end to end on Proxmox VE 9.2: a container that only existed in R2 was
+  downloaded, checked and restored with `restore 117 latest --new-id 9100`.
+
 ## 2.0.0 - 2026-10-23
 
 Rewritten in Python (3.11+, standard library only); same commands, config files and R2 layout,
