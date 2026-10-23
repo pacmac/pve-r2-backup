@@ -1,0 +1,4 @@
+# never commit credentials
+*.env
+rclone.conf
+*.pass
