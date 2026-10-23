@@ -2,6 +2,20 @@
 
 ## Planned
 
+### Scheduled restore test (`verify`)
+
+Monthly timer: download one random backup from R2, compare it with the local
+copy (or its stored checksum when the local one was pruned), test the archive,
+and report the result in the email. Proves every month that backups can be
+pulled back, not just that they were uploaded.
+
+### Debian package
+
+Ship as `pve-r2-backup_<version>_all.deb` (GitHub releases, later an APT
+repository): installs the script, vzdump hook, timers, logrotate, man page and
+shell completion; `apt remove` cleans up. Credentials in `/root/.pve-r2/` are
+left alone by upgrades.
+
 ### Host configuration backup (`hostconfig`)
 
 vzdump only backs up guests. The host's own configuration (storage, backup
@@ -40,5 +54,7 @@ anywhere. On a single node it is only a few MB, so a daily copy is cheap.
   can alert when uploads stop even if the host itself is down.
 - **Upload speed setting** in `r2.env` (parallel files / parts), for hosts with
   more RAM or a faster uplink than the defaults assume.
-- **`restore` helper**: list backups of a guest in R2 and download one into a
-  dump directory in a single step.
+- **Proxmox backup-provider plugin** (long term, separate project): a Perl
+  storage plugin implementing Proxmox's backup provider API
+  (`new_backup_provider()`), so R2 appears as a backup storage in the GUI and
+  backup/restore use the normal Proxmox buttons. Waits for that API to settle.

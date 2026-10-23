@@ -1,7 +1,8 @@
 # pve-r2-backup
 
-Off-site copies of Proxmox VE `vzdump` backups in **Cloudflare R2**, with
-email reports through Proxmox's own notification system.
+Off-site copies of Proxmox VE `vzdump` backups in **Cloudflare R2**, an
+interactive **restore** that pulls them back, and email reports through
+Proxmox's own notification system.
 
 No Proxmox Backup Server required. vzdump keeps writing to your local backup
 storage as usual; after every backup job this script uploads the new archives
@@ -23,6 +24,9 @@ to R2 with [rclone](https://rclone.org).
   summary is also sent, flagged **STALE** if nothing has uploaded successfully
   for 8 days. Mail goes through Proxmox notification targets (SMTP, Gotify,
   webhook, …).
+- **Restore from a menu:** pick a guest, then a dated version, then download
+  only, restore as a new guest, or restore over the existing one. Downloads are
+  checksum-verified and archive-tested before anything is restored.
 - **Optional client-side encryption** (rclone crypt). Folder names stay
   readable so the lifecycle rules keep working.
 - Safe to re-run: `install` and `config` can be run again at any time;
@@ -30,17 +34,18 @@ to R2 with [rclone](https://rclone.org).
 
 ## Requirements
 
-- Proxmox VE 8 or 9 (tested on 9.2), run as root.
+- Proxmox VE 8 or 9 (tested on 9.2), run as root. Uses the Python 3 that comes
+  with Proxmox (standard library only, nothing extra to install).
 - A Cloudflare R2 bucket and an **R2 API token** with *Object Read & Write*,
   ideally limited to that bucket.
-- `install` adds `jq` (from Debian) and the current `rclone` (from rclone.org).
-  The rclone in Debian's repositories is too old for R2.
+- `install` adds the current `rclone` from rclone.org. The rclone in Debian's
+  repositories is too old for R2.
 
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pacmac/pve-r2-backup/main/pve-r2-backup.sh -o /root/pve-r2-backup.sh
-bash /root/pve-r2-backup.sh install     # rclone, jq, vzdump hook, weekly timer
+curl -fsSL https://raw.githubusercontent.com/pacmac/pve-r2-backup/main/pve-r2-backup.py -o /root/pve-r2-backup.py
+python3 /root/pve-r2-backup.py install  # rclone, vzdump hook, weekly timer
 pve-r2-backup config                    # R2 details + this host's folder, tests access
 pve-r2-backup notify-test               # check that emails reach you
 pve-r2-backup sync --latest -n          # dry run: what would be uploaded
@@ -92,9 +97,10 @@ R2 counts the age from the **upload** time, not from when the backup was made.
 
 | Command | What it does |
 |---|---|
-| `install` | Installs rclone and jq, this script as `/usr/local/sbin/pve-r2-backup`, the vzdump hook (`script:` in `/etc/vzdump.conf`), and a weekly timer (Mon 06:00) with logrotate |
+| `install` | Installs rclone, this script as `/usr/local/sbin/pve-r2-backup`, the vzdump hook (`script:` in `/etc/vzdump.conf`), and a weekly timer (Mon 06:00) with logrotate |
 | `config` | Asks for (or confirms) the R2 details, path and storage, then writes `/root/.pve-r2/{r2.env,rclone.conf}` (mode 600) and tests read/write |
 | `sync [--since N \| --latest \| --all] [-n]` | Upload backups changed in the last N days (default 2), the newest good backup per guest, or everything. `-n` = dry run |
+| `restore [VMID [VERSION]]` | Choose a guest and a version from R2, then download / restore (see below) |
 | `weekly` | Catch-up upload of the last 14 days plus the summary email (this is what the timer runs) |
 | `status` | Config, last run/success, hook, timer, and what's in R2 |
 | `notify-test` | Sends a test email |
@@ -140,28 +146,65 @@ This also fixes the normal Proxmox backup-job emails.
 
 ## Restoring from R2
 
-You need the R2 credentials (and the encryption passwords, if used). On any
-Proxmox host with rclone set up through `config`:
+Run `pve-r2-backup restore` and follow the menus:
 
-```bash
-# see what's there
-rclone --config /root/.pve-r2/rclone.conf lsf r2:my-bucket/backups/pve/site1/weekly/
+```
+Guests with backups in my-bucket/backups/pve/site1:
 
-# download one backup into a dump directory
-rclone --config /root/.pve-r2/rclone.conf copy \
-  r2:my-bucket/backups/pve/site1/weekly/ /var/lib/vz/dump/ \
-  --include 'vzdump-lxc-101-2026_10_18-*' -P
+    #    VMID  type  name                    here     ver  newest                  size
+    1     100  lxc   postgres                exists     2  2026-10-18 01:15   194.5 MiB
+    2     117  lxc   zt-oslan                deleted    1  2026-02-22 01:18   212.9 MiB
+   ...
+Choose number (or q to quit): 2
 
-# then restore as usual (GUI: storage → Backups → Restore), or:
-pct restore 101 /var/lib/vz/dump/vzdump-lxc-101-2026_10_18-01_15_04.tar.zst --storage local-lvm
-qmrestore /var/lib/vz/dump/vzdump-qemu-1001-....vma.zst 1001 --storage local-lvm
+Backups of lxc 117:
+    #  date              folder          size  local
+    1  2026-02-22 01:18  other      212.9 MiB
+
+What now?
+    1  Download only (shows under the storage's Backups in the GUI)
+    2  Restore as a NEW guest (original is not touched)
+    3  Restore OVER existing guest ...   (only if it exists and is stopped)
 ```
 
-With encryption enabled, use the `r2crypt:` remote instead of `r2:<bucket>`,
-e.g. `r2crypt:backups/pve/site1/weekly/`.
+- You can type the list number or the VMID itself. Names of deleted guests
+  come from the backup's `.notes` file.
+- The backup is downloaded into the dump directory of `R2_STORAGE`, so it also
+  appears under that storage's *Backups* in the GUI. Download speed is about
+  100 MiB/s for large files (16 parallel streams). rclone checks the checksum,
+  then the archive is tested (`zstd -t`). A copy already on local disk is not
+  downloaded again.
+- **New guest:** next free VMID suggested, target storage chosen from a list,
+  `--unique` (new MAC addresses) when the original still exists. Not started
+  unless you say so.
+- **Over the existing guest:** only when it is stopped, and you have to type
+  the VMID again to confirm.
 
-**Test a restore** now and then, and keep the R2 token (and the encryption
-passwords) somewhere other than the host being backed up.
+Without menus:
+
+```bash
+pve-r2-backup restore --list                         # guests in R2
+pve-r2-backup restore 101                            # versions of 101 (menu)
+pve-r2-backup restore 101 latest --download-only
+pve-r2-backup restore 101 2026_10_11 --new-id 9101 --storage local-lvm
+pve-r2-backup restore 101 latest --overwrite         # 101 must be stopped
+pve-r2-backup restore --path my-bucket/backups/pve/site2   # another host's backups
+```
+
+**Disaster recovery on a new host:** install Proxmox, run `install` and
+`config` with the *same* R2 credentials (and encryption passwords, if used),
+then `restore --path <bucket>/<old host's path>`. Keep the R2 token and the
+encryption passwords somewhere other than the hosts being backed up.
+
+**By hand**, with plain rclone (`r2crypt:` instead of `r2:<bucket>` if
+encrypted):
+
+```bash
+rclone --config /root/.pve-r2/rclone.conf lsf r2:my-bucket/backups/pve/site1/weekly/
+rclone --config /root/.pve-r2/rclone.conf copy r2:my-bucket/backups/pve/site1/weekly/ /var/lib/vz/dump/ \
+  --include 'vzdump-lxc-101-2026_10_18-*' -P
+pct restore 9101 /var/lib/vz/dump/vzdump-lxc-101-2026_10_18-01_15_04.tar.zst --storage local-lvm
+```
 
 ## Troubleshooting
 
@@ -175,6 +218,15 @@ passwords) somewhere other than the host being backed up.
 
 Log: `/var/log/pve-r2-backup.log` · State: `/var/lib/pve-r2-backup/state`
 
+## Development
+
+One file, Python 3.11+ standard library only. Tests for the selection and
+parsing logic (no Proxmox or R2 needed):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## How the hook works
 
 vzdump calls the script at every stage of a backup. At `job-end`, it starts
@@ -184,7 +236,7 @@ together, the second upload waits for the first (lock) instead of being skipped.
 
 ## Roadmap
 
-Host configuration backup (`/etc/pve`, `config.db`, `/etc`, …) is planned, see [ROADMAP.md](ROADMAP.md).
+Planned: scheduled restore tests (`verify`), host configuration backup, a Debian package. See [ROADMAP.md](ROADMAP.md).
 
 ## License
 

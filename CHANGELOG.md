@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.0 - 2026-10-23
+
+Rewritten in Python (3.11+, standard library only); same commands, config files and R2 layout,
+so existing installs upgrade by running `install` with the new file.
+
+- New `restore` command: menu of guests in R2 -> dated versions -> download only, restore as a
+  new guest, or restore over the existing (stopped) guest. Also usable without menus.
+- Restore downloads use 16 parallel streams, are checksum-verified and archive-tested (`zstd -t`).
+- `restore --path` browses another host's backups (disaster recovery on a new host).
+- `jq` is no longer needed.
+- Unit tests for guest classification, `--latest` selection, upload counting and `r2.env` parsing.
+- Fixed: log lines written twice during background uploads.
+
 ## 1.0.0 - 2026-10-23
 
 First release.
