@@ -16,6 +16,26 @@ repository): installs the script, vzdump hook, timers, logrotate, man page and
 shell completion; `apt remove` cleans up. Credentials in `/root/.pve-r2/` are
 left alone by upgrades.
 
+### Other S3-compatible storage providers
+
+rclone already speaks to almost every S3 service, so most of the tool is
+provider-neutral. Support for e.g. **AWS S3, Backblaze B2, Wasabi, Akamai/Linode
+Object Storage, Hetzner, OVHcloud, Scaleway, IDrive e2** and self-hosted
+**MinIO / Garage** needs:
+
+- `config`: choose the provider first, then ask only what it needs (endpoint,
+  region, access key / secret). rclone's provider presets (`provider = AWS`,
+  `Wasabi`, `Minio`, …) handle most quirks.
+- Settings renamed from `R2_*` to provider-neutral names (`S3_*`), still
+  reading old `r2.env` files so existing installs keep working.
+- Provider notes in the README: **egress fees** (R2 has none; most others charge
+  for downloads, which matters for restores and `verify`), how to set lifecycle
+  rules, object lock / immutability, and storage classes to avoid for backups
+  (e.g. archive tiers with retrieval delays).
+- Per-provider upload limits: part size and maximum parts per object, so large
+  `vma.zst` files always fit.
+- Probably a new name (e.g. `pve-s3-backup`), with `pve-r2-backup` kept as an alias.
+
 ### Host configuration backup (`hostconfig`)
 
 vzdump only backs up guests. The host's own configuration (storage, backup
