@@ -11,6 +11,9 @@
 #   pve-r2-backup sync [MODE] [-n]   upload backups (--latest | --all | --since DAYS, default --since 2)
 #   pve-r2-backup restore [VMID [VERSION]] [options]
 #                                    pick a guest and a version from R2, download and/or restore
+#   pve-r2-backup hostconfig [list | get [VERSION]]
+#                                    encrypted backup of this host's own configuration
+#                                    (/etc incl. /etc/pve, config.db, inventory); list or pull one back
 #   pve-r2-backup status             show config, last result, hook, timer and what is in R2
 #   pve-r2-backup weekly             catch-up sync + summary email (run by the timer)
 #   pve-r2-backup notify-test        send a test email through the Proxmox notification system
@@ -18,6 +21,7 @@
 #
 # Layout in R2:  <bucket>/<path>/<class>/<vzdump files>
 #   e.g. my-bucket/backups/pve/site1/weekly/  (bucket = R2_BUCKET, folder = R2_PATH, unique per host)
+#   <bucket>/<path>/host/<hostname>-config-<date>.tar.zst.gpg   host configuration (always encrypted)
 #   class = weekly | monthly | other, derived from the backup job schedule that
 #   includes the guest. Use one R2 lifecycle rule per <path>/<class>/ prefix.
 #   NOTE: R2 lifecycle age counts from UPLOAD time, not from the backup date.
@@ -39,6 +43,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -51,7 +56,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.0.3"
+VERSION = "2.1.0"
 
 SELF_INSTALLED = Path("/usr/local/sbin/pve-r2-backup")
 # credentials (r2.env) and generated rclone.conf live in root's home, mode 700/600
@@ -78,11 +83,28 @@ VZDUMP_RE = re.compile(r"^vzdump-(qemu|lxc)-(\d+)-(\d{4}_\d{2}_\d{2}-\d{2}_\d{2}
 SIDECAR_EXTS = (".log", ".notes", ".protected")
 # job schedules that run monthly or less often
 RARE_SCHEDULE_RE = re.compile(r"(monthly|yearly|annually|quarterly|semiannually|[0-9*]+-[0-9*]+-[0-9])")
+# host configuration backup: paths relative to /, plus R2_HOSTCONFIG_EXTRA
+HOST_DIR = "host"
+HOSTCONFIG_PATHS = ["etc", "root/.pve-r2", "root/.ssh", "root/.bashrc", "root/.profile",
+                    "usr/local", "var/spool/cron/crontabs", "var/lib/vz/snippets"]
+HOSTCONFIG_RE = re.compile(r"^(.+)-config-(\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2})\.tar\.zst\.gpg$")
+# rebuildable clutter skipped inside every included folder
+HOSTCONFIG_EXCLUDES = [".git", "venv", ".venv", "node_modules", "__pycache__", ".cache"]
+PVE_DB = Path("/var/lib/pve-cluster/config.db")
+# written to inventory.txt: what is needed to rebuild disks, pools and network by hand
+INVENTORY_CMDS = ["pveversion -v", "hostnamectl", "ip -br link", "ip -br addr", "ip route",
+                  "lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS", "blkid", "pvs", "vgs", "lvs -a",
+                  "zpool status", "zpool list -v", "zfs list -o name,used,avail,refer,mountpoint",
+                  "pvesm status", "qm list", "pct list", "df -h", "dpkg --get-selections"]
+# days without a host config backup before the weekly summary warns
+HOSTCONFIG_STALE_DAYS = 3
+
 # rclone INFO line for a finished file; large files are "Multi-thread Copied (new)"
 COPIED_RE = re.compile(r"INFO  : (.+?): (?:Multi-thread )?Copied \((?:new|replaced existing)\)")
 
 ENV_KEYS = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET", "R2_PATH",
-            "R2_STORAGE", "R2_NOTIFY", "R2_STALE_DAYS", "R2_CRYPT_PASSWORD", "R2_CRYPT_SALT"]
+            "R2_STORAGE", "R2_NOTIFY", "R2_STALE_DAYS", "R2_CRYPT_PASSWORD", "R2_CRYPT_SALT",
+            "R2_HOSTCONFIG_PASS", "R2_HOSTCONFIG_EXTRA"]
 ENV_COMMENTS = {
     "R2_ACCOUNT_ID": "Cloudflare R2 settings for pve-r2-backup (keep chmod 600)",
     "R2_BUCKET": "Full R2 path for THIS host = <R2_BUCKET>/<R2_PATH>, unique per host",
@@ -91,6 +113,9 @@ ENV_COMMENTS = {
     "R2_STALE_DAYS": "Weekly summary flags STALE when the last successful upload is older than this",
     "R2_CRYPT_PASSWORD": "Optional client-side encryption. Keep these OUTSIDE this host too,\n"
                          "# without them the R2 copies cannot be restored.",
+    "R2_HOSTCONFIG_PASS": "Passphrase for the encrypted host config backups (hostconfig). Keep a copy\n"
+                          "# OUTSIDE this host (password manager): it is needed to rebuild a lost host.",
+    "R2_HOSTCONFIG_EXTRA": "Extra folders for the host config backup, comma separated (e.g. /usr/share/scripts,/opt/tools)",
 }
 
 
@@ -337,17 +362,21 @@ def read_state():
         return {}
 
 
-def save_state(result, summary):
+def write_state(**updates):
+    """Merge updates into the state file; other keys are kept."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     state = read_state()
-    now = str(int(time.time()))
-    state.update(last_run=now, last_result=result, last_summary=summary.replace("\n", " "))
-    if result == "OK":
-        state["last_success"] = now
+    state.update({k: str(v).replace("\n", " ") for k, v in updates.items()})
     state.setdefault("last_success", "")
     tmp = STATE_FILE.with_suffix(".new")
-    tmp.write_text("".join(f"{k}={state[k]}\n" for k in ("last_run", "last_result", "last_summary", "last_success")))
+    tmp.write_text("".join(f"{k}={v}\n" for k, v in state.items()))
     tmp.replace(STATE_FILE)
+
+
+def save_state(result, summary):
+    now = int(time.time())
+    write_state(last_run=now, last_result=result, last_summary=summary,
+                **({"last_success": now} if result == "OK" else {}))
 
 
 # ------------------------------------------------------------------------------
@@ -469,6 +498,33 @@ def rclone_copy(src_dir, dest, files, dry):
         os.unlink(list_file)
 
 
+def check_upload(selected, local_sizes, remote_sizes):
+    """Compare what should be in R2 with what is there.
+    selected: names chosen for upload; local_sizes / remote_sizes: {name: bytes} now.
+    Returns (missing, vanished): missing = still local but absent or a different size in R2
+    (a real failure); vanished = deleted locally before it could be uploaded (reported only)."""
+    missing, vanished = [], []
+    for name in selected:
+        if name not in local_sizes:
+            if name not in remote_sizes:
+                vanished.append(name)
+        elif remote_sizes.get(name) != local_sizes[name]:
+            missing.append(name)
+    return sorted(missing), sorted(vanished)
+
+
+def remote_sizes(dest, files):
+    """{name: size} of `files` in the R2 folder `dest` (only those that exist)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".list", delete=False) as f:
+        f.write("\n".join(files) + "\n")
+        list_file = f.name
+    try:
+        items = json.loads(rclone("lsjson", dest, "--files-from", list_file, "--files-only") or "[]")
+    finally:
+        os.unlink(list_file)
+    return {it["Name"]: it["Size"] for it in items}
+
+
 def do_sync(mode="since", days=2, dry=False, wait=0):
     env = load_env()
     with Lock(wait) as locked:
@@ -510,8 +566,26 @@ def _sync(env, mode, days, dry):
         size = sum((src / n).stat().st_size for n in copied if (src / n).exists())
         total_files += len(copied)
         total_bytes += size
+        extra = []
+        if not dry:
+            # rclone can report success after silently dropping files, so check R2 itself
+            local_now = {n: (src / n).stat().st_size for n in cls_files if (src / n).exists()}
+            try:
+                missing, vanished = check_upload(cls_files, local_now, remote_sizes(dest, cls_files))
+            except (Fatal, ValueError) as e:
+                missing, vanished = [f"(could not list R2: {e})"], []
+            if missing:
+                ok = False
+                log(f"Verify {dest}: {len(missing)} file(s) missing or wrong size in R2: {', '.join(missing)}")
+                extra.append(f"           missing in R2: {', '.join(missing)}")
+            if vanished:
+                log(f"Verify {dest}: deleted locally before upload: {', '.join(vanished)}")
+                extra.append(f"           deleted locally before upload (not in R2): {', '.join(vanished)}")
+        if not ok:
+            ok_all = False
         report.append(f"{cls:<8} {'OK' if ok else 'FAILED':<6} {len(cls_files):>3} selected, "
-                      f"{len(copied):>3} uploaded ({human(size)})")
+                      f"{len(copied):>3} uploaded ({human(size)})" + ("" if dry else ", verified in R2"))
+        report += extra
         if not ok:
             report += ["           " + l for l in [l for l in lines if "ERROR" in l or "Failed" in l][-5:]]
     if not report:
@@ -521,10 +595,11 @@ def _sync(env, mode, days, dry):
 
     summary = f"{total_files} file(s), {human(total_bytes)} uploaded"
     body = "\n".join(report)
+    vanished_any = any("deleted locally before upload" in l for l in report)
     if ok_all:
         log(f"Sync finished OK - {summary}")
         save_state("OK", summary)
-        if env["R2_NOTIFY"] == "always":
+        if env["R2_NOTIFY"] == "always" or vanished_any:
             notify(env, f"OK - {summary}", f"Upload {label} to {env['R2_BUCKET']}/{env['R2_PATH']} finished OK.\n\n{body}")
         return 0
     save_state("FAILED", summary)
@@ -561,6 +636,9 @@ def do_weekly():
         subject = "weekly: catch-up upload FAILED"
     else:
         subject = "weekly OK"
+    hc_line, hc_ok = hostconfig_summary(env, state)
+    if not hc_ok and subject == "weekly OK":
+        subject = "weekly: host config backup missing"
     try:
         local = [b for b in pvesh(f"/nodes/{local_node()}/storage/{env['R2_STORAGE']}/content", "--content", "backup")]
         local_txt = f"{len(local)}, {human(sum(b.get('size', 0) for b in local))}"
@@ -568,7 +646,8 @@ def do_weekly():
         local_txt = f"(error: {e})"
     body = [f"Last successful upload : {age_text(last_ok)}",
             f"Last run               : {age_text(state.get('last_run'))} - {state.get('last_result')}: {state.get('last_summary')}",
-            f"Local backups          : {local_txt}", "",
+            f"Local backups          : {local_txt}",
+            f"Host config backup     : {hc_line}", "",
             f"In R2 ({env['R2_BUCKET']}/{env['R2_PATH']}):"]
     body += [f"  {cls:<8} {txt}" for cls, txt in r2_sizes(env).items()]
     notify(env, subject, "\n".join(body))
@@ -582,6 +661,204 @@ def do_notify_test():
     print("Test mail handed to sendmail -> root -> Proxmox notification targets. Check your inbox.")
     print("Nothing arriving? Check Datacenter > Notifications (target + default-matcher), "
           "and 'mailq' / journalctl -t postfix/smtp")
+
+
+# ------------------------------------------------------------------------------
+# host configuration backup
+# ------------------------------------------------------------------------------
+
+RESTORE_TXT = """Host configuration backup made by pve-r2-backup on {host}, {date}.
+
+Contents
+  etc/                 /etc of the host, including etc/pve (guest configs, storage.cfg,
+                       jobs.cfg, users, firewall, notifications, certificates)
+  _hostconfig/config.db
+                       copy of /var/lib/pve-cluster/config.db, the database behind /etc/pve
+  _hostconfig/inventory.txt
+                       disks, LVM, ZFS, network, storages, guests, packages at backup time
+  root/, usr/local/, var/spool/cron/ and any extra folders
+
+Single files: copy them from here, e.g. etc/pve/qemu-server/100.conf or
+etc/pve/lxc/101.conf (into /etc/pve/... on the host).
+
+Rebuild a lost host:
+  1. Install the same Proxmox VE major version with the SAME hostname and IP.
+  2. Recreate disks / pools / volume groups as listed in _hostconfig/inventory.txt.
+  3. Compare and copy etc/network/interfaces (NIC names can differ on new hardware).
+  4. Restore the Proxmox configuration:
+       systemctl stop pve-cluster
+       cp _hostconfig/config.db /var/lib/pve-cluster/config.db
+       rm -f /var/lib/pve-cluster/config.db-wal /var/lib/pve-cluster/config.db-shm
+       systemctl start pve-cluster
+     then reboot.
+  5. Copy back what else you need (root/.ssh, usr/local, cron, ...).
+  6. pve-r2-backup install + config, then restore guests: pve-r2-backup restore
+"""
+
+
+def hostconfig_paths(env):
+    """Paths (relative to /) that go into the archive: the defaults plus R2_HOSTCONFIG_EXTRA
+    (comma and/or space separated), only those that exist."""
+    extra = [x.strip().strip("/") for x in re.split(r"[,\s]+", env.get("R2_HOSTCONFIG_EXTRA", "")) if x.strip("/ ")]
+    out = []
+    for rel in HOSTCONFIG_PATHS + extra:
+        if rel not in out and Path("/", rel).exists():
+            out.append(rel)
+    return out
+
+
+def hostconfig_versions(items):
+    """[{name, host, ts, size}] newest first, from an rclone lsjson listing of <path>/host/."""
+    out = []
+    for it in items:
+        m = HOSTCONFIG_RE.match(it.get("Name") or it.get("Path", ""))
+        if m:
+            out.append({"name": m.group(0), "host": m.group(1), "ts": m.group(2), "size": it.get("Size", 0)})
+    return sorted(out, key=lambda v: v["ts"], reverse=True)
+
+
+def inventory_text():
+    parts = []
+    for cmd in INVENTORY_CMDS:
+        try:
+            p = subprocess.run(shlex.split(cmd), text=True, capture_output=True, timeout=120)
+            body = (p.stdout + p.stderr).rstrip()
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            body = "(timed out)"
+        parts.append(f"===== {cmd}\n{body}\n")
+    return "\n".join(parts)
+
+
+def gpg(workdir, passphrase, *args):
+    """gpg with its own temporary home, passphrase from a file (never on the command line)."""
+    home = Path(workdir, "gnupg")
+    home.mkdir(mode=0o700, exist_ok=True)
+    pf = Path(workdir, "pass")
+    pf.write_text(passphrase)
+    pf.chmod(0o600)
+    try:
+        run(["gpg", "--homedir", str(home), "--batch", "--yes", "--quiet", "--pinentry-mode", "loopback",
+             "--passphrase-file", str(pf), *args])
+    finally:
+        pf.unlink(missing_ok=True)
+
+
+def build_hostconfig(env, workdir, host, ts):
+    """Create the encrypted archive in workdir; returns (path, list of included paths)."""
+    stage = Path(workdir, "stage", "_hostconfig")
+    stage.mkdir(parents=True)
+    if PVE_DB.exists():
+        run(["sqlite3", str(PVE_DB), f".backup {stage / 'config.db'}"])
+    (stage / "inventory.txt").write_text(inventory_text())
+    (stage / "RESTORE.txt").write_text(RESTORE_TXT.format(host=host, date=ts_text(ts)))
+    paths = hostconfig_paths(env)
+    tar = Path(workdir, "hostconfig.tar.zst")
+    p = subprocess.run(["tar", "--zstd", "-cf", str(tar), "--ignore-failed-read", "--warning=no-file-changed",
+                        "--warning=no-file-ignored", *[f"--exclude={x}" for x in HOSTCONFIG_EXCLUDES],
+                        "-C", "/", *paths, "-C", str(stage.parent), "_hostconfig"],
+                       text=True, capture_output=True)
+    if p.returncode not in (0, 1):          # 1 = some file changed while reading: fine
+        err = p.stderr.strip().splitlines()
+        raise Fatal(f"tar failed: {err[-1] if err else p.returncode}")
+    out = Path(workdir, f"{host}-config-{ts}.tar.zst.gpg")
+    gpg(workdir, env["R2_HOSTCONFIG_PASS"], "--symmetric", "--cipher-algo", "AES256",
+        "--compress-algo", "none", "-o", str(out), str(tar))
+    tar.unlink()
+    return out, paths
+
+
+def do_hostconfig(dry=False, if_configured=False):
+    env = load_env()
+    if not env.get("R2_HOSTCONFIG_PASS"):
+        if if_configured:               # timer on a host where it was never set up
+            return 0
+        raise Fatal("No host config passphrase set - run: pve-r2-backup config")
+    host = socket.gethostname().split(".")[0]
+    ts = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+    try:
+        with tempfile.TemporaryDirectory(prefix="pve-r2-hostconfig-", dir="/var/tmp") as wd:
+            out, paths = build_hostconfig(env, wd, host, ts)
+            size = out.stat().st_size
+            dest = remote_path(env, f"{env['R2_PATH']}/{HOST_DIR}/{out.name}")
+            if dry:
+                print(f"Would upload {out.name} ({human(size)}) to {dest}\nIncludes: /" + ", /".join(paths))
+                return 0
+            rclone("copyto", str(out), dest, "--retries", "5")
+            got = remote_sizes(remote_path(env, f"{env['R2_PATH']}/{HOST_DIR}"), [out.name]).get(out.name)
+            if got != size:
+                raise Fatal(f"uploaded {out.name} but R2 shows size {got}, expected {size}")
+    except Fatal as e:
+        log(f"Host config backup FAILED: {e}")
+        write_state(last_hostconfig_result=f"FAILED: {e}")
+        notify(env, f"host config backup FAILED - {e}",
+               f"The encrypted backup of this host's configuration could not be made or uploaded:\n\n  {e}")
+        raise
+    log(f"Host config backup OK - {out.name} ({human(size)}) to {dest}")
+    write_state(last_hostconfig=int(time.time()), last_hostconfig_result=f"OK {out.name} ({human(size)})")
+    return 0
+
+
+def hostconfig_summary(env, state):
+    """(text, ok) for the weekly summary and status."""
+    if not env.get("R2_HOSTCONFIG_PASS"):
+        return "not set up (run: pve-r2-backup config)", False
+    last = state.get("last_hostconfig")
+    ok = bool(last) and time.time() - int(last) < HOSTCONFIG_STALE_DAYS * 86400
+    text = f"{age_text(last)} - {state.get('last_hostconfig_result', '')}"
+    return (text if ok else f"{text}  <-- no backup for more than {HOSTCONFIG_STALE_DAYS} days"), ok
+
+
+def do_hostconfig_list(env, bucket, path):
+    try:
+        items = json.loads(rclone("lsjson", "--files-only", remote_path(env, f"{path}/{HOST_DIR}", bucket)))
+    except (ValueError, Fatal):
+        items = []
+    versions = hostconfig_versions(items)
+    if not versions:
+        print(f"No host config backups in {bucket}/{path}/{HOST_DIR}/")
+    return versions
+
+
+def do_hostconfig_cmd(a):
+    need_root()
+    if a.action == "backup":
+        return do_hostconfig(a.dry_run, a.if_configured)
+    env = load_env()
+    bucket, path = env["R2_BUCKET"], env["R2_PATH"]
+    if a.path:
+        bucket, _, path = a.path.strip("/").partition("/")
+    versions = do_hostconfig_list(env, bucket, path)
+    if not versions:
+        return 1
+    if a.action == "list" or not versions:
+        print(f"Host config backups in {bucket}/{path}/{HOST_DIR}/:\n")
+        for i, v in enumerate(versions, 1):
+            print(f"  {i:>3}  {ts_text(v['ts'])}  {v['host']:<16} {human(v['size']):>10}")
+        return 0
+    v = pick_version(versions, a.version or "latest")
+    target = Path(a.to or f"/root/hostconfig-{v['host']}-{v['ts']}")
+    if target.resolve() == Path("/") or (target.exists() and any(target.iterdir())):
+        raise Fatal(f"{target} must be a new or empty folder (never /) - choose another with --to")
+    passphrase = env.get("R2_HOSTCONFIG_PASS", "")
+    if a.path or not passphrase:
+        passphrase = ask("Passphrase of that host's config backups", passphrase or None, keep_spaces=True)
+    with tempfile.TemporaryDirectory(prefix="pve-r2-hostconfig-", dir="/var/tmp") as wd:
+        enc = Path(wd, v["name"])
+        print(f"Downloading {v['name']} ({human(v['size'])})...")
+        rclone("copyto", remote_path(env, f"{path}/{HOST_DIR}/{v['name']}", bucket), str(enc))
+        tar = Path(wd, "hostconfig.tar.zst")
+        try:
+            gpg(wd, passphrase, "--decrypt", "-o", str(tar), str(enc))
+        except Fatal:
+            raise Fatal("decryption failed - wrong passphrase?")
+        target.mkdir(parents=True, exist_ok=True)
+        target.chmod(0o700)
+        run(["tar", "--zstd", "-xf", str(tar), "-C", str(target)])
+    print(f"\nUnpacked into {target}  (mode 700: it contains keys and passwords)")
+    print(f"Read {target}/_hostconfig/RESTORE.txt for what is in it and how to rebuild a host.")
+    return 0
 
 
 # ------------------------------------------------------------------------------
@@ -632,6 +909,31 @@ Description=Weekly catch-up upload of vzdump backups to Cloudflare R2
 OnCalendar=Mon *-*-* 06:00
 Persistent=true
 RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target
+"""
+
+HC_UNIT = f"{UNIT_NAME}-hostconfig"
+HC_SERVICE = f"""[Unit]
+Description=Encrypted backup of this Proxmox host's configuration to Cloudflare R2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={SELF_INSTALLED} hostconfig --if-configured
+Nice=10
+IOSchedulingClass=idle
+"""
+
+HC_TIMER = """[Unit]
+Description=Daily host configuration backup to Cloudflare R2
+
+[Timer]
+OnCalendar=*-*-* 03:30
+Persistent=true
+RandomizedDelaySec=30m
 
 [Install]
 WantedBy=timers.target
@@ -707,10 +1009,12 @@ def do_install():
 
     Path(f"/etc/systemd/system/{UNIT_NAME}.service").write_text(SERVICE)
     Path(f"/etc/systemd/system/{UNIT_NAME}.timer").write_text(TIMER)
+    Path(f"/etc/systemd/system/{HC_UNIT}.service").write_text(HC_SERVICE)
+    Path(f"/etc/systemd/system/{HC_UNIT}.timer").write_text(HC_TIMER)
     Path(f"/etc/logrotate.d/{UNIT_NAME}").write_text(LOGROTATE)
     run(["systemctl", "daemon-reload"])
-    run(["systemctl", "enable", "--now", f"{UNIT_NAME}.timer"])
-    print("Weekly catch-up timer enabled.\n")
+    run(["systemctl", "enable", "--now", f"{UNIT_NAME}.timer", f"{HC_UNIT}.timer"])
+    print("Weekly catch-up timer and daily host config timer enabled.\n")
     print(f"Next: {SELF_INSTALLED.name} config")
 
 
@@ -811,6 +1115,23 @@ def do_config():
     else:
         print(f"Encryption: ON (passwords in {ENV_FILE})")
 
+    print("\n== Host configuration backup (daily, always encrypted) ==")
+    print("Saves /etc (incl. /etc/pve), the Proxmox config database, root's keys, /usr/local and cron,")
+    print("so a lost host can be rebuilt. Needs its own passphrase - keep a copy OFF this host.")
+    pw = ask("Passphrase (Enter = generate one)", env.get("R2_HOSTCONFIG_PASS") or None, keep_spaces=True)
+    if not pw:
+        pw = secrets.token_urlsafe(18)
+        print(f"\n  Generated passphrase:  {pw}\n  SAVE IT NOW in your password manager.\n")
+    env["R2_HOSTCONFIG_PASS"] = pw
+    print("Always included: /" + ", /".join(HOSTCONFIG_PATHS))
+    print("Add your own scripts/data folders and credential files outside /etc and /root/.ssh,")
+    print("e.g. /usr/share/scripts,/root/.config  (.git, venv and node_modules are skipped)")
+    env["R2_HOSTCONFIG_EXTRA"] = ask("Extra folders to include, comma separated (Enter = none)",
+                                     env.get("R2_HOSTCONFIG_EXTRA") or None, keep_spaces=True)
+    missing = [x for x in re.split(r"[,\s]+", env["R2_HOSTCONFIG_EXTRA"]) if x and not Path(x).exists()]
+    if missing:
+        print(f"  [WARN] not found (skipped until they exist): {', '.join(missing)}")
+
     save_env(env)
     write_rclone_conf(env)
     print(f"\nWrote {ENV_FILE} and {RCLONE_CONF}")
@@ -834,7 +1155,7 @@ def do_config():
     claim_site(env)
     if env.get("R2_CRYPT_PASSWORD"):
         print(f"Encryption ON - store the passwords from {ENV_FILE} somewhere off this host!")
-    print(f"\nUploads go to: {env['R2_BUCKET']}/{env['R2_PATH']}/{{weekly,monthly,other}}/")
+    print(f"\nUploads go to: {env['R2_BUCKET']}/{env['R2_PATH']}/{{weekly,monthly,other,host}}/")
     print(f"Next: {SELF_INSTALLED.name} sync --latest -n   (dry run), then without -n")
 
 
@@ -843,12 +1164,13 @@ def do_uninstall():
     if VZDUMP_CONF.exists():
         keep = [l for l in VZDUMP_CONF.read_text().splitlines() if l.strip() != f"script: {SELF_INSTALLED}"]
         VZDUMP_CONF.write_text("\n".join(keep) + ("\n" if keep else ""))
-    run(["systemctl", "disable", "--now", f"{UNIT_NAME}.timer"], check=False)
+    run(["systemctl", "disable", "--now", f"{UNIT_NAME}.timer", f"{HC_UNIT}.timer"], check=False)
     for p in (f"/etc/systemd/system/{UNIT_NAME}.service", f"/etc/systemd/system/{UNIT_NAME}.timer",
+              f"/etc/systemd/system/{HC_UNIT}.service", f"/etc/systemd/system/{HC_UNIT}.timer",
               f"/etc/logrotate.d/{UNIT_NAME}"):
         Path(p).unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"], check=False)
-    print(f"Removed hook and timer. Kept {CONF_DIR}, {SELF_INSTALLED} and everything in R2.")
+    print(f"Removed hook and timers. Kept {CONF_DIR}, {SELF_INSTALLED} and everything in R2.")
 
 
 def do_status():
@@ -865,7 +1187,9 @@ def do_status():
     print(f"Timer       : {timer_on or 'not installed'} / next {nxt}")
     print(f"Reports     : mail to root ({env['R2_NOTIFY']} + weekly summary), stale after {env['R2_STALE_DAYS']} days")
     print(f"Last run    : {age_text(state.get('last_run'))} - {state.get('last_result', '')} {state.get('last_summary', '')}")
-    print(f"Last success: {age_text(state.get('last_success'))}\n")
+    print(f"Last success: {age_text(state.get('last_success'))}")
+    print(f"Host config : {hostconfig_summary(env, state)[0]}")
+    print(f"  includes  : /" + ", /".join(hostconfig_paths(env)) + "\n")
     print("Guest classes:")
     for vmid, cls in sorted(current_classes().items(), key=lambda kv: int(kv[0])):
         print(f"  {vmid:<6} {cls}")
@@ -1165,6 +1489,13 @@ def main(argv=None):
     r.add_argument("--no-unique", dest="unique", action="store_false")
     r.add_argument("--start", action="store_true", help="start the guest after restore")
     r.add_argument("-y", "--yes", action="store_true", help="no questions (uses defaults)")
+    h = sub.add_parser("hostconfig", help="encrypted backup of this host's configuration; list / get")
+    h.add_argument("action", nargs="?", choices=["backup", "list", "get"], default="backup")
+    h.add_argument("version", nargs="?", help="for get: latest | list number | date prefix")
+    h.add_argument("--to", help="for get: folder to unpack into (default /root/hostconfig-<host>-<date>)")
+    h.add_argument("--path", help="another host's R2 path, e.g. my-bucket/backups/pve/site2")
+    h.add_argument("-n", "--dry-run", action="store_true", help="build the archive but don't upload")
+    h.add_argument("--if-configured", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("status", help="config, last result, hook, timer and what is in R2")
     sub.add_parser("weekly", help="catch-up sync + summary email (run by the timer)")
     sub.add_parser("notify-test", help="send a test email")
@@ -1182,6 +1513,8 @@ def main(argv=None):
             return do_sync(mode, a.since or 2, a.dry_run, 7200 if a.wait else 0)
         elif a.cmd == "restore":
             return do_restore(a)
+        elif a.cmd == "hostconfig":
+            return do_hostconfig_cmd(a)
         elif a.cmd == "status":
             do_status()
         elif a.cmd == "weekly":

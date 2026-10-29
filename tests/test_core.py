@@ -122,6 +122,54 @@ class TestDefaultStorage(unittest.TestCase):
         self.assertEqual(m.default_storage("", [], []), "")
 
 
+class TestCheckUpload(unittest.TestCase):
+    def test_missing_vanished_ok(self):
+        selected = ["a.log", "a.tar.zst", "b.tar.zst", "c.tar.zst", "d.tar.zst"]
+        local = {"a.log": 5, "a.tar.zst": 100, "b.tar.zst": 50, "d.tar.zst": 7}  # c deleted locally
+        remote = {"a.log": 5, "a.tar.zst": 100, "b.tar.zst": 49}                  # b truncated, d absent
+        missing, vanished = m.check_upload(selected, local, remote)
+        self.assertEqual(missing, ["b.tar.zst", "d.tar.zst"])
+        self.assertEqual(vanished, ["c.tar.zst"])
+
+    def test_deleted_locally_but_already_in_r2_is_fine(self):
+        self.assertEqual(m.check_upload(["x"], {}, {"x": 1}), ([], []))
+
+
+class TestHostConfig(unittest.TestCase):
+    def test_extra_paths_comma_or_space_separated(self):
+        paths = m.hostconfig_paths({"R2_HOSTCONFIG_EXTRA": "/tmp, /does/not/exist,/etc  /usr"})
+        self.assertEqual(paths[0], "etc")
+        self.assertIn("tmp", paths)
+        self.assertIn("usr", paths)
+        self.assertNotIn("does/not/exist", paths)
+        self.assertEqual(paths.count("etc"), 1, "no duplicates")
+
+    def test_versions_newest_first(self):
+        items = [{"Name": "pve1-config-2026_10_28-03_31_00.tar.zst.gpg", "Size": 10},
+                 {"Name": "pve1-config-2026_10_29-03_40_12.tar.zst.gpg", "Size": 12},
+                 {"Name": "notes.txt", "Size": 1}]
+        v = m.hostconfig_versions(items)
+        self.assertEqual([x["ts"] for x in v], ["2026_10_29-03_40_12", "2026_10_28-03_31_00"])
+        self.assertEqual(v[0]["host"], "pve1")
+        self.assertEqual(m.pick_version(v, "2026_10_28")["size"], 10)
+
+    def test_state_keeps_other_keys(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            old, m.STATE_FILE = m.STATE_FILE, Path(d, "state")
+            try:
+                m.write_state(last_hostconfig=123, last_hostconfig_result="OK x")
+                m.save_state("OK", "2 file(s)")
+                st = m.read_state()
+                self.assertEqual(st["last_hostconfig"], "123")
+                self.assertEqual(st["last_result"], "OK")
+                self.assertTrue(st["last_success"])
+                m.save_state("FAILED", "boom")
+                self.assertEqual(m.read_state()["last_success"], st["last_success"])
+            finally:
+                m.STATE_FILE = old
+
+
 class TestRestoreHelpers(unittest.TestCase):
     VERSIONS = [{"ts": "2026_10_18-01_15_00"}, {"ts": "2026_10_11-01_15_00"}, {"ts": "2026_07_12-01_18_53"}]
 

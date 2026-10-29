@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.1.0 - 2026-10-29
+
+- New `hostconfig` command: daily encrypted (gpg AES-256) backup of the host's own
+  configuration to `<path>/host/`: `/etc` incl. `/etc/pve`, a consistent copy of
+  `config.db`, an inventory of disks/LVM/ZFS/network/guests/packages, root's SSH keys,
+  `/usr/local`, cron and optional extra folders (`R2_HOSTCONFIG_EXTRA`, comma separated).
+  `hostconfig list` / `hostconfig get` download, decrypt and unpack one; the archive
+  contains `RESTORE.txt` with rebuild steps. `config` asks for the passphrase and folders;
+  `install` adds a daily timer (03:30). Failures are mailed; the weekly summary warns
+  when the last one is older than 3 days.
+- Every upload is now checked in R2: each selected file must exist there with the same
+  size. rclone could report success after dropping a file that disappeared during the
+  upload. Missing files fail the run; backups deleted locally before upload are reported
+  (and mailed).
+
 ## 2.0.3 - 2026-10-29
 
 - `config` no longer suggests a storage called `backups` that may not exist (and then

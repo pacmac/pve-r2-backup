@@ -36,38 +36,20 @@ Object Storage, Hetzner, OVHcloud, Scaleway, IDrive e2** and self-hosted
   `vma.zst` files always fit.
 - Probably a new name (e.g. `pve-s3-backup`), with `pve-r2-backup` kept as an alias.
 
-### Host configuration backup (`hostconfig`)
-
-vzdump only backs up guests. The host's own configuration (storage, backup
-jobs, users, firewall, networking, notification targets, …) is not saved
-anywhere. On a single node it is only a few MB, so a daily copy is cheap.
-
-**Contents** of one archive:
-
-| What | Why |
-|---|---|
-| `/var/lib/pve-cluster/config.db`, copied with `sqlite3 .backup` | Real source of `/etc/pve`; restoring it on a reinstalled host brings back most of the Proxmox configuration |
-| `/etc/pve` as plain files | Readable, so single files (e.g. one guest's `.conf`) can be taken out without a full restore |
-| `/etc` | Network, `fstab`, GRUB, `modprobe.d` (e.g. `vfio.conf`), SSH host keys, cron, Samba, UPS, custom systemd units |
-| `/root/.pve-r2`, `/root/.ssh`, `/usr/local` | This tool's R2 setup, root's SSH keys, local scripts |
-| Inventory text file | `pveversion -v`, `zpool status` / `zfs list`, LVM layout, `lsblk`, IP addresses, `pvesm status`, guest list, installed packages: how to rebuild disks and pools |
-
-**Design:**
-
-- New command `pve-r2-backup hostconfig`: build `tar.zst`, encrypt, upload to
-  `<path>/host/<hostname>-config-<date>.tar.zst.gpg`.
-- **Always encrypted** (`gpg --symmetric`, AES-256), even when guest backups
-  are not: the archive holds the Proxmox CA key, SSH host keys, SMTP and R2
-  credentials. The passphrase is asked for once in `config`, stored in
-  `r2.env`, and must also be kept off the host (password manager).
-- Daily systemd timer; failures mailed like uploads; the weekly summary shows
-  the date of the last config backup and warns if it is older than a few days.
-- README section on restore: decrypt, extract single files, restore
-  `config.db` on a reinstalled host (`systemctl stop pve-cluster`, replace,
-  start).
-- Suggested R2 lifecycle rule: `<path>/host/` after 365 days.
-
 ## Ideas
+
+- **Central dashboard ("mini backup server")**: one page for all hosts: last upload
+  and result per host, host config backups, STALE warnings, size and cost per bucket,
+  a browser of what is in R2 (per guest and date, with the date the lifecycle rule will
+  delete it) and a read-only view of each host's settings and backup jobs. Runs on a
+  separate small machine/container with a read-only R2 token; write actions (restore,
+  config) only later, if at all.
+- **Pull model**: a separate machine fetches new backups from the hosts and uploads
+  them, so the Proxmox hosts hold no R2 credentials and a compromised host cannot
+  touch the off-site copies.
+- **Compare with PBS 4 + S3 datastore** (technology preview): check Cloudflare R2
+  compatibility, local cache needs and cost; it would add incremental/deduplicated
+  backups and GUI restore, which this tool cannot do.
 
 - **MQTT status** for Home Assistant: publish a retained JSON status
   (result, time, files, bytes) to `pve-r2/<site>/status`, so an outside system

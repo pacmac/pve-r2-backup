@@ -27,6 +27,13 @@ to R2 with [rclone](https://rclone.org).
 - **Restore from a menu:** pick a guest, then a dated version, then download
   only, restore as a new guest, or restore over the existing one. Downloads are
   checksum-verified and archive-tested before anything is restored.
+- **Host configuration backup:** a daily, always-encrypted copy of the host's own
+  configuration (`/etc` incl. `/etc/pve`, the Proxmox config database, root's SSH keys,
+  `/usr/local`, cron, any extra folders) plus an inventory of disks, pools and network,
+  so a lost host can be rebuilt. `hostconfig get` pulls one back.
+- **Every upload is checked in R2:** after rclone finishes, each file is looked up in R2
+  and compared by size. A missing file fails the run and is mailed; a backup deleted
+  locally before it could be uploaded is reported.
 - **Optional client-side encryption** (rclone crypt). Folder names stay
   readable so the lifecycle rules keep working.
 - Safe to re-run: `install` and `config` can be run again at any time;
@@ -72,6 +79,7 @@ then **API Tokens → Manage** (on the right of the page) → **Create API token
 <bucket>/<path>/weekly/    guests in weekly (or more frequent) backup jobs
 <bucket>/<path>/monthly/   guests in monthly / yearly jobs
 <bucket>/<path>/other/     guests in no enabled job (e.g. deleted guests)
+<bucket>/<path>/host/      host configuration backups (<hostname>-config-<date>.tar.zst.gpg)
 <bucket>/<path>/.owner     which host owns this path
 ```
 
@@ -90,6 +98,7 @@ rules*, one per prefix. For example:
 | `backups/pve/site1/weekly/` | 90 days |
 | `backups/pve/site1/monthly/` | 180 days |
 | `backups/pve/site1/other/` | long, or never (may be the only copy of deleted guests) |
+| `backups/pve/site1/host/` | 365 days (about 1 MB a day) |
 
 R2 counts the age from the **upload** time, not from when the backup was made.
 
@@ -97,10 +106,12 @@ R2 counts the age from the **upload** time, not from when the backup was made.
 
 | Command | What it does |
 |---|---|
-| `install` | Installs rclone, this script as `/usr/local/sbin/pve-r2-backup`, the vzdump hook (`script:` in `/etc/vzdump.conf`), and a weekly timer (Mon 06:00) with logrotate |
+| `install` | Installs rclone, this script as `/usr/local/sbin/pve-r2-backup`, the vzdump hook (`script:` in `/etc/vzdump.conf`), a weekly timer (Mon 06:00), a daily host config timer (03:30) and logrotate |
 | `config` | Asks for (or confirms) the R2 details, path and storage, then writes `/root/.pve-r2/{r2.env,rclone.conf}` (mode 600) and tests read/write |
 | `sync [--since N \| --latest \| --all] [-n]` | Upload backups changed in the last N days (default 2), the newest good backup per guest, or everything. `-n` = dry run |
 | `restore [VMID [VERSION]]` | Choose a guest and a version from R2, then download / restore (see below) |
+| `hostconfig [-n]` | Encrypted backup of this host's configuration to `<path>/host/` (a daily timer runs it) |
+| `hostconfig list` / `hostconfig get [VERSION] [--to DIR]` | List them, or download, decrypt and unpack one into a new folder (never over `/`) |
 | `weekly` | Catch-up upload of the last 14 days plus the summary email (this is what the timer runs) |
 | `status` | Config, last run/success, hook, timer, and what's in R2 |
 | `notify-test` | Sends a test email |
@@ -112,6 +123,7 @@ Settings in `/root/.pve-r2/r2.env` that `config` doesn't ask for:
 |---|---|---|
 | `R2_NOTIFY` | `failures` | `always` also emails successful uploads |
 | `R2_STALE_DAYS` | `8` | Weekly summary says STALE after this many days without a successful upload |
+| `R2_HOSTCONFIG_EXTRA` | empty | Extra folders for the host config backup, comma separated (also asked by `config`) |
 
 After editing `r2.env` by hand, run `config` again so `rclone.conf` is rebuilt.
 
@@ -206,6 +218,37 @@ rclone --config /root/.pve-r2/rclone.conf copy r2:my-bucket/backups/pve/site1/we
 pct restore 9101 /var/lib/vz/dump/vzdump-lxc-101-2026_10_18-01_15_04.tar.zst --storage local-lvm
 ```
 
+## Host configuration backup
+
+vzdump only backs up guests. `hostconfig` saves the host itself, once a day at 03:30
+(and whenever you run it, e.g. before an upgrade). One archive holds:
+
+| What | Why |
+|---|---|
+| `/etc`, including `/etc/pve` | network, storage, backup jobs, users, firewall, notification targets, guest configs, certificates, `fstab`, `modprobe.d`, SSH host keys |
+| `_hostconfig/config.db` | consistent copy of `/var/lib/pve-cluster/config.db`, the database behind `/etc/pve` |
+| `_hostconfig/inventory.txt` | `pveversion -v`, disks, LVM, ZFS, IP addresses, routes, storages, guests, installed packages |
+| `/root/.ssh`, `/root/.pve-r2`, `/usr/local`, cron, `/var/lib/vz/snippets` | keys, this tool's settings, local scripts, hook/cloud-init snippets |
+| your extra folders | `R2_HOSTCONFIG_EXTRA`, e.g. `/usr/share/scripts` (`.git`, `venv`, `node_modules` are skipped) |
+
+It is **always encrypted** (gpg, AES-256) with its own passphrase, because it contains
+the Proxmox keys and all passwords. `config` asks for it (Enter generates one). **Keep
+the passphrase outside the host**, or the backup can't be opened when it's needed.
+Typical size: under 1 MB.
+
+```bash
+pve-r2-backup hostconfig            # make one now
+pve-r2-backup hostconfig list       # what's in R2
+pve-r2-backup hostconfig get        # newest -> /root/hostconfig-<host>-<date>/
+pve-r2-backup hostconfig get 2026_10_29 --to /root/cfg --path my-bucket/backups/pve/site2
+```
+
+Single files (e.g. `etc/pve/qemu-server/100.conf`) can be copied out of the unpacked
+folder. To rebuild a lost host, follow `_hostconfig/RESTORE.txt` in the archive: install
+the same Proxmox version with the same hostname, recreate pools from the inventory, then
+put `config.db` back (`systemctl stop pve-cluster`, copy, `systemctl start pve-cluster`)
+and reboot.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -236,7 +279,7 @@ together, the second upload waits for the first (lock) instead of being skipped.
 
 ## Roadmap
 
-Planned: scheduled restore tests (`verify`), host configuration backup, a Debian package. See [ROADMAP.md](ROADMAP.md).
+Planned: scheduled restore tests (`verify`), support for other S3 providers, a Debian package. See [ROADMAP.md](ROADMAP.md).
 
 ## License
 
