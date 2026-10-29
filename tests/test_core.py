@@ -107,6 +107,21 @@ class TestEnv(unittest.TestCase):
         self.assertEqual({k: v for k, v in m.parse_env(m.format_env(env)).items()}, env)
 
 
+class TestDefaultStorage(unittest.TestCase):
+    STORES = ["local", "usb"]
+
+    def test_saved_storage_kept(self):
+        self.assertEqual(m.default_storage("usb", self.STORES, [{"storage": "local"}]), "usb")
+
+    def test_missing_saved_falls_back_to_job_storage(self):
+        jobs = [{"storage": "usb", "enabled": 0}, {"storage": "local"}, {"storage": "gone"}]
+        self.assertEqual(m.default_storage("backups", self.STORES, jobs), "local")
+
+    def test_no_jobs_uses_first_storage(self):
+        self.assertEqual(m.default_storage("", self.STORES, []), "local")
+        self.assertEqual(m.default_storage("", [], []), "")
+
+
 class TestRestoreHelpers(unittest.TestCase):
     VERSIONS = [{"ts": "2026_10_18-01_15_00"}, {"ts": "2026_10_11-01_15_00"}, {"ts": "2026_07_12-01_18_53"}]
 

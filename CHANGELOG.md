@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.3 - 2026-10-29
+
+- `config` no longer suggests a storage called `backups` that may not exist (and then
+  stopped with `storage 'backups' does not exist`). It now suggests the storage your
+  backup jobs write to, explains the question, lists only enabled storages, and asks
+  again on a wrong name.
+- `config` saves the credentials and path as soon as they are entered, so an error
+  in a later step doesn't lose them.
+- The vzdump hook does nothing until `config` has been completed.
+
 ## 2.0.2 - 2026-10-23
 
 - Fixed `install` failing with `HTTP Error 403` when downloading rclone: downloads.rclone.org

@@ -51,7 +51,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
 SELF_INSTALLED = Path("/usr/local/sbin/pve-r2-backup")
 # credentials (r2.env) and generated rclone.conf live in root's home, mode 700/600
@@ -255,8 +255,7 @@ def load_env():
         base = env.get("R2_BASE_PATH", "")
         env["R2_PATH"] = f"{base}/{env['R2_HOST_PREFIX']}" if base else env["R2_HOST_PREFIX"]
     env["R2_PATH"] = env.get("R2_PATH", "").strip("/")
-    env.setdefault("R2_STORAGE", "backups")
-    env["R2_STORAGE"] = env["R2_STORAGE"] or "backups"
+    env["R2_STORAGE"] = env.get("R2_STORAGE", "")
     env["R2_NOTIFY"] = env.get("R2_NOTIFY") or "failures"
     env["R2_STALE_DAYS"] = env.get("R2_STALE_DAYS") or "8"
     return env
@@ -296,6 +295,8 @@ def site_name(env):
 
 
 def dump_dir(env):
+    if not env.get("R2_STORAGE"):
+        raise Fatal("No Proxmox storage set - run: pve-r2-backup config")
     path = (pvesh(f"/storage/{env['R2_STORAGE']}") or {}).get("path")
     if not path or not Path(path, "dump").is_dir():
         raise Fatal(f"Storage '{env['R2_STORAGE']}' has no dump directory (path: {path or 'unknown'})")
@@ -370,6 +371,18 @@ def vmid_classes(jobs, all_ids):
             if classes.get(vmid) != "weekly":
                 classes[vmid] = cls
     return classes
+
+
+def default_storage(saved, stores, jobs):
+    """Suggested storage for config: the saved one if it still exists, else the one
+    most enabled backup jobs write to, else the only/first storage with backups."""
+    if saved in stores:
+        return saved
+    used = [j.get("storage") for j in jobs if str(j.get("enabled", 1)) != "0"]
+    used = [s for s in used if s in stores]
+    if used:
+        return max(dict.fromkeys(used), key=used.count)
+    return stores[0] if stores else ""
 
 
 def current_classes():
@@ -585,8 +598,8 @@ def do_hook(phase):
         if phase == "job-end" and ENV_FILE.exists():
             env = load_env()
             store = os.environ.get("STOREID", "")
-            # only react to jobs that wrote to our storage
-            if not store or store == env["R2_STORAGE"]:
+            # only react to jobs that wrote to our storage, and only once configured
+            if env["R2_STORAGE"] and env.get("R2_BUCKET") and store in ("", env["R2_STORAGE"]):
                 with LOG_FILE.open("a") as logf:
                     subprocess.Popen([str(SELF_INSTALLED), "sync", "--since", "2", "--wait"],
                                      stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
@@ -677,7 +690,7 @@ def do_install():
 
     CONF_DIR.mkdir(mode=0o700, exist_ok=True)
     if not ENV_FILE.exists():
-        save_env({"R2_STORAGE": "backups", "R2_NOTIFY": "failures", "R2_STALE_DAYS": "8"})
+        save_env({"R2_NOTIFY": "failures", "R2_STALE_DAYS": "8"})
         print(f"Created {ENV_FILE}")
 
     # vzdump hook - refuse to replace a hook script that isn't ours
@@ -776,10 +789,20 @@ def do_config():
         raise Fatal("Give bucket AND folder, e.g. my-bucket/backups/pve/site1 - not just the bucket")
     env["R2_BUCKET"], env["R2_PATH"] = full.split("/", 1)
     print(f"  Bucket : {env['R2_BUCKET']}\n  Folder : {env['R2_PATH']}/{{weekly,monthly,other}}/")
-    stores = [s["storage"] for s in pvesh("/storage") if "backup" in s.get("content", "")]
-    print(f"Proxmox storages with backups: {', '.join(stores)}")
-    env["R2_STORAGE"] = ask("Storage to upload from", env["R2_STORAGE"])
-    dump_dir(env)
+    save_env(env)           # keep what was typed so far, even if a later step fails
+    stores = [s["storage"] for s in pvesh("/storage")
+              if "backup" in s.get("content", "") and not s.get("disable")]
+    if not stores:
+        raise Fatal("No enabled Proxmox storage holds backups - add one or enable it first")
+    print("\nWhich Proxmox storage do your backup jobs write to? Its dump/ folder is what gets")
+    print(f"uploaded (Datacenter > Backup > job > Storage). Storages with backups: {', '.join(stores)}")
+    default = default_storage(env["R2_STORAGE"], stores, pvesh("/cluster/backup"))
+    while True:
+        env["R2_STORAGE"] = ask("Storage to upload from", default)
+        if env["R2_STORAGE"] in stores:
+            break
+        print(f"  -> '{env['R2_STORAGE']}' is not one of: {', '.join(stores)}", file=sys.stderr)
+    print(f"  Uploading from {dump_dir(env)}")
 
     if not env.get("R2_CRYPT_PASSWORD"):
         if ask_yes("Encrypt backups before upload?"):
