@@ -229,7 +229,7 @@ vzdump only backs up guests. `hostconfig` saves the host itself, once a day at 0
 | `_hostconfig/config.db` | consistent copy of `/var/lib/pve-cluster/config.db`, the database behind `/etc/pve` |
 | `_hostconfig/inventory.txt` | `pveversion -v`, disks, LVM, ZFS, IP addresses, routes, storages, guests, installed packages |
 | `/root/.ssh`, `/root/.pve-r2`, `/usr/local`, cron, `/var/lib/vz/snippets` | keys, this tool's settings, local scripts, hook/cloud-init snippets |
-| your extra folders | `R2_HOSTCONFIG_EXTRA`, e.g. `/usr/share/scripts` (`.git`, `venv`, `node_modules` are skipped) |
+| your extra folders | `R2_HOSTCONFIG_EXTRA`, e.g. `/usr/share/scripts` (`.git`, `venv`, `node_modules` and disk images are skipped) |
 
 It is **always encrypted** (gpg, AES-256) with its own passphrase, because it contains
 the Proxmox keys and all passwords. `config` asks for it (Enter generates one). **Keep

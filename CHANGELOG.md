@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.1 - 2026-10-29
+
+- Host config backup skips disk images (`*.img`, `*.qcow2`, `*.raw`, `*.iso`, `*.vmdk`)
+  in extra folders; guest backups cover those and they made the daily archive large.
+
 ## 2.1.0 - 2026-10-29
 
 - New `hostconfig` command: daily encrypted (gpg AES-256) backup of the host's own

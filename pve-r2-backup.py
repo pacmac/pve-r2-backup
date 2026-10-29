@@ -56,7 +56,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 SELF_INSTALLED = Path("/usr/local/sbin/pve-r2-backup")
 # credentials (r2.env) and generated rclone.conf live in root's home, mode 700/600
@@ -88,8 +88,9 @@ HOST_DIR = "host"
 HOSTCONFIG_PATHS = ["etc", "root/.pve-r2", "root/.ssh", "root/.bashrc", "root/.profile",
                     "usr/local", "var/spool/cron/crontabs", "var/lib/vz/snippets"]
 HOSTCONFIG_RE = re.compile(r"^(.+)-config-(\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2})\.tar\.zst\.gpg$")
-# rebuildable clutter skipped inside every included folder
-HOSTCONFIG_EXCLUDES = [".git", "venv", ".venv", "node_modules", "__pycache__", ".cache"]
+# rebuildable clutter and disk images (guest backups cover those) skipped in every included folder
+HOSTCONFIG_EXCLUDES = [".git", "venv", ".venv", "node_modules", "__pycache__", ".cache",
+                       "*.img", "*.qcow2", "*.raw", "*.iso", "*.vmdk"]
 PVE_DB = Path("/var/lib/pve-cluster/config.db")
 # written to inventory.txt: what is needed to rebuild disks, pools and network by hand
 INVENTORY_CMDS = ["pveversion -v", "hostnamectl", "ip -br link", "ip -br addr", "ip route",
@@ -1125,7 +1126,7 @@ def do_config():
     env["R2_HOSTCONFIG_PASS"] = pw
     print("Always included: /" + ", /".join(HOSTCONFIG_PATHS))
     print("Add your own scripts/data folders and credential files outside /etc and /root/.ssh,")
-    print("e.g. /usr/share/scripts,/root/.config  (.git, venv and node_modules are skipped)")
+    print("e.g. /usr/share/scripts,/root/.config  (.git, venv, node_modules and disk images are skipped)")
     env["R2_HOSTCONFIG_EXTRA"] = ask("Extra folders to include, comma separated (Enter = none)",
                                      env.get("R2_HOSTCONFIG_EXTRA") or None, keep_spaces=True)
     missing = [x for x in re.split(r"[,\s]+", env["R2_HOSTCONFIG_EXTRA"]) if x and not Path(x).exists()]
